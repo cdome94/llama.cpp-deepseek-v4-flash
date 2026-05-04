@@ -1,21 +1,72 @@
 # DeepSeek v4 Flash experimental support
 
-This is a fork of llama.cpp that implements DSv4 support, with generated GGUF that aims to target MacBooks with just 128GB of RAM using 2bit quantization of routed experts.
+This is a fork of [antirez/llama.cpp-deepseek-v4-flash](https://github.com/antirez/llama.cpp-deepseek-v4-flash) that adds **NVIDIA CUDA support** for running DeepSeek V4 Flash quantized GGUF models with GPU acceleration.
 
-Disclaimer:
+## CUDA fix (this fork)
+
+The original fork only supported CPU and Metal (macOS). On NVIDIA GPUs, running with `-ngl` caused an immediate crash:
+
+```
+GGML_ASSERT(src0->type == GGML_TYPE_F32) failed
+```
+
+**Root causes fixed:**
+- `ggml_cuda_op_concat` had three hard assertions requiring F32 type, blocking any quantized input
+- Float offset calculations used hardcoded `/ 4` (sizeof float) instead of `ggml_nbytes()`
+
+**Changes in [`ggml/src/ggml-cuda/concat.cu`](ggml/src/ggml-cuda/concat.cu):**
+- Removed F32-only assertions, replaced with `src0->type == dst->type` consistency check
+- Added byte-level `cudaMemcpy` path for contiguous quantized tensors along dim 1/2/3
+- F32 path left entirely unchanged
+
+Tested on **NVIDIA GB10** (122 GB unified memory) with `IQ2XXS-w2Q2K-AProjQ8-SExpQ8` quantization.
+
+## Build (NVIDIA CUDA)
+
+```bash
+git clone https://github.com/cdome94/llama.cpp-deepseek-v4-flash
+cd llama.cpp-deepseek-v4-flash
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release -j$(nproc)
+```
+
+## Download the model
+
+```bash
+pip install huggingface_hub
+huggingface-cli download antirez/deepseek-v4-gguf \
+    DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+    --local-dir .
+```
+
+## Run (interactive chat)
+
+```bash
+./build/bin/llama-cli \
+    -m DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+    -cnv \
+    -ngl 999 \
+    -c 8192
+```
+
+## Run (API server, OpenAI-compatible)
+
+```bash
+./build/bin/llama-server \
+    -m DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+    -ngl 999 \
+    -c 8192 \
+    --host 0.0.0.0 --port 8080
+```
+
+---
+
+Disclaimer (from original fork):
 * This code was written with heavy help from GPT 5.5 and the official DeepSeek v4 Flash as reference.
 * The model quantized in this way behaves very very well in the chat, frontier-model vibes, but it was not extensively tested.
-* The code runs both with CPU and Metal backends. With Metal is faster.
+* The original code runs on CPU and Metal backends. This fork adds NVIDIA CUDA support.
 
 Download the GGUF from: https://huggingface.co/antirez/deepseek-v4-gguf
-
-Then to test it run with (but for production you may want to tune context, disable thinking for faster replies and so forth):
-
-```
-llama-cli \
-    -m DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat.gguf \
-    -cnv
-```
 
 # llama.cpp
 
