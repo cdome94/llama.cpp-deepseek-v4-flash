@@ -162,33 +162,82 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == src1->type);
+    GGML_ASSERT(src0->type == dst->type);
+
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        const float * src0_d = (const float *)src0->data;
-        const float * src1_d = (const float *)src1->data;
+        if (is_f32) {
+            // Original F32 fast path (unchanged)
+            const float * src0_d = (const float *)src0->data;
+            const float * src1_d = (const float *)src1->data;
+            float * dst_d = (float *)dst->data;
 
-        float * dst_d = (float *)dst->data;
-
-        if (dim != 3) {
-            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_f32_cuda(
-                        src0_d + i3 * (src0->nb[3] / 4),
-                        src1_d + i3 * (src1->nb[3] / 4),
-                        dst_d + i3 * ( dst->nb[3] / 4),
-                        src0->ne[0], src0->ne[1], src0->ne[2],
-                        dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+            if (dim != 3) {
+                for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+                    concat_f32_cuda(
+                            src0_d + i3 * (src0->nb[3] / sizeof(float)),
+                            src1_d + i3 * (src1->nb[3] / sizeof(float)),
+                            dst_d  + i3 * ( dst->nb[3] / sizeof(float)),
+                            src0->ne[0], src0->ne[1], src0->ne[2],
+                            dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+                }
+            } else {
+                const size_t size0 = ggml_nbytes(src0);
+                const size_t size1 = ggml_nbytes(src1);
+                CUDA_CHECK(cudaMemcpyAsync(dst_d,                        src0_d, size0, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync((char *)dst_d + size0, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
             }
         } else {
-            const size_t size0 = ggml_nbytes(src0);
-            const size_t size1 = ggml_nbytes(src1);
+            // Generic byte-level path for quantized / non-F32 types
+            const char * src0_d = (const char *)src0->data;
+            const char * src1_d = (const char *)src1->data;
+            char       * dst_d  = (char       *)dst->data;
 
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,           src0_d, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0/4, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            if (dim == 3) {
+                const size_t size0 = ggml_nbytes(src0);
+                const size_t size1 = ggml_nbytes(src1);
+                CUDA_CHECK(cudaMemcpyAsync(dst_d,          src0_d, size0, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(dst_d + size0,  src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            } else if (dim == 2) {
+                // Iterate over dim3 slices; within each, src0 planes then src1 planes
+                const size_t src0_slice = src0->nb[3]; // bytes per i3 slice in src0
+                const size_t src1_slice = src1->nb[3];
+                const size_t dst_slice  =  dst->nb[3];
+                for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+                    CUDA_CHECK(cudaMemcpyAsync(dst_d  + i3 * dst_slice,
+                                               src0_d + i3 * src0_slice,
+                                               src0_slice, cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(dst_d  + i3 * dst_slice + src0_slice,
+                                               src1_d + i3 * src1_slice,
+                                               src1_slice, cudaMemcpyDeviceToDevice, stream));
+                }
+            } else if (dim == 1) {
+                // Iterate over dim3 and dim2 slices
+                const size_t src0_row = src0->nb[2]; // bytes per (i3,i2) slice in src0
+                const size_t src1_row = src1->nb[2];
+                const size_t dst_row  =  dst->nb[2];
+                for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+                    for (int i2 = 0; i2 < dst->ne[2]; i2++) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            dst_d  + i3 * (size_t)dst->nb[3]  + i2 * dst_row,
+                            src0_d + i3 * (size_t)src0->nb[3] + i2 * src0_row,
+                            src0_row, cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            dst_d  + i3 * (size_t)dst->nb[3]  + i2 * dst_row + src0_row,
+                            src1_d + i3 * (size_t)src1->nb[3] + i2 * src1_row,
+                            src1_row, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+            } else {
+                // dim == 0: concatenation within a row — not supported for quantized types
+                GGML_ABORT("concat along dim 0 not supported for non-F32 quantized types");
+            }
         }
     } else {
+        // non-contiguous path: only supported for F32
+        GGML_ASSERT(is_f32 && "non-contiguous concat only supported for F32; use contiguous tensors for quantized types");
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_f32_non_cont<dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
